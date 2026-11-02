@@ -1,6 +1,6 @@
 {
   "name": "magpie-doubao-desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Doubao (豆包) chat models, signed in with the 豆包工作 desktop app's own session",
   "type": "module",
   "main": "./index.mjs",

@@ -26,6 +26,11 @@ const offline = [
     assert.equal(p.npm, "@ai-sdk/openai-compatible")
     assert.ok(Object.keys(p.models).length >= 3)
     assert.equal(p.models["doubao-2.1-pro"].tool_call, false, "tools are not sent")
+    assert.equal(
+      Object.values(p.models).every((m) => m.reasoning === false),
+      true,
+      "no separate reasoning stream exists, so none may be claimed",
+    )
   }],
 
   ["one sign-in method, reading the desktop app", async () => {

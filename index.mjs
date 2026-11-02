@@ -39,6 +39,8 @@ const MODELS = [
 ]
 
 // 低 / 中 / 高, the three levels the app offers; the app's own default is 5.
+// It is forwarded as the app sends it, but it changes only how the answer
+// reads, since none of it comes back as a separate reasoning stream.
 const DEFAULT_EFFORT = 5
 const EFFORTS = new Set([3, 4, 5])
 
@@ -59,7 +61,13 @@ function modelMap() {
       {
         name: m.name,
         limit: { context: m.context, output: 16000 },
-        reasoning: true,
+        // No separate reasoning stream. Asked to show its work, the reply
+        // came back as 527 content deltas and nothing else: every patch was
+        // patch_object 102 with content.text_block, with no thinking channel
+        // beside it. Saying `reasoning: true` here would only earn magpie an
+        // empty thinking pane, so it says false and the reasoning stays in
+        // the text where it arrives.
+        reasoning: false,
         tool_call: false,
       },
     ]),
