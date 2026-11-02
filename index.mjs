@@ -349,7 +349,16 @@ async function* streamCompletion(cookies, conversationId, prompt, modelKey, effo
   const acc = newAccumulator()
   try {
     while (!ended) {
-      const { value, done } = await reader.read()
+      let chunk
+      try {
+        chunk = await reader.read()
+      } catch (e) {
+        // The caller hanging up is not a failed reply: magpie cancels a
+        // stream it no longer wants, and that arrives as an AbortError here.
+        if (e?.name === "AbortError") break
+        throw e
+      }
+      const { value, done } = chunk
       if (done) break
       buf += decoder.decode(value, { stream: true })
       let cut
@@ -662,7 +671,13 @@ function makePlugin() {
               const stream = new ReadableStream({
                 async start(controller) {
                   const enc = new TextEncoder()
-                  const send = (s) => controller.enqueue(enc.encode(s))
+                  // The consumer may have gone away; enqueuing into a closed
+                  // stream must not turn a finished reply into an error.
+                  const send = (s) => {
+                    try {
+                      controller.enqueue(enc.encode(s))
+                    } catch {}
+                  }
                   try {
                     send(openaiChunk(id, model, { role: "assistant" }))
                     let any = false
@@ -675,6 +690,12 @@ function makePlugin() {
                     send("data: [DONE]\n\n")
                   } catch (e) {
                     thread = null // a fresh conversation next time
+                    if (e?.name === "AbortError") {
+                      try {
+                        controller.close()
+                      } catch {}
+                      return
+                    }
                     send(
                       "data: " +
                         JSON.stringify({ error: { message: e?.message ?? String(e), type: "api_error" } }) +
