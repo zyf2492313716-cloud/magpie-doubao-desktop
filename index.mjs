@@ -437,40 +437,90 @@ function contentText(content) {
   return content.map((p) => (typeof p === "string" ? p : p?.type === "text" ? p.text ?? "" : "")).join("")
 }
 
-function lastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role !== "user") continue
-    const text = contentText(messages[i].content).trim()
-    if (text) return text
+// How many non-text parts (images, documents) a message carried, so the model
+// can be told they didn't arrive instead of guessing at them.
+function droppedParts(content) {
+  if (!Array.isArray(content)) return 0
+  return content.filter((p) => typeof p === "object" && p && p.type !== "text").length
+}
+
+// A harness bolts its own state onto the conversation as extra user text: this
+// run's clock, the browser's time zone, reminders it injected. None of it is
+// something the user asked, and leaving it in made the model answer the
+// timestamp instead of the request. Matched on the shape of those blocks,
+// which covers what the harnesses on this machine send; anything else stays.
+const HARNESS_BLOCKS = [
+  /^Current runtime context\.[\s\S]*?(?=\n\n|$)/gm,
+  /^Time sampled while preparing turn[^\n]*\n(?:[^\n]*\n){0,4}/gm,
+  /^Browser time zone for this request:[^\n]*\n(?:[^\n]*\n){0,2}/gm,
+  /^Elapsed since the preceding[^\n]*\n?/gm,
+  /^<system-reminder>[\s\S]*?<\/system-reminder>\n?/gm,
+  /^\s*\[[a-z][a-z0-9- ]{2,30}\]\s*$/gm,
+]
+
+function stripHarnessNoise(text) {
+  let out = text
+  for (const re of HARNESS_BLOCKS) out = out.replace(re, "")
+  return out.replace(/\n{3,}/g, "\n\n").trim()
+}
+
+// Consecutive turns from one side are one turn: a harness that sends the ask
+// and then its own context block as two user messages shouldn't read as two
+// questions.
+function mergeTurns(messages) {
+  const merged = []
+  for (const m of messages) {
+    if (m?.role !== "user" && m?.role !== "assistant") continue
+    const text = stripHarnessNoise(contentText(m.content))
+    if (!text) continue
+    const last = merged.at(-1)
+    if (last && last.role === m.role) last.text += "\n\n" + text
+    else merged.push({ role: m.role, text, dropped: droppedParts(m.content) })
   }
-  return ""
+  return merged
 }
 
 // What Doubao is asked. Its chat keeps history on the server, but a request
 // from here isn't given that history: two turns in the same conversation were
-// checked, and the second one forgot the first. So the turns the agent
-// already had are sent along as a transcript, which was checked to work.
+// checked, and the second one forgot the first. So the turns the agent already
+// had are sent along as a transcript, which was checked to work.
 // The system prompt is left out — it's the harness's own boilerplate, not
 // something of the conversation's, and it would be paid for on every turn.
 const TRANSCRIPT_CAP = 6000 // characters of history, newest kept first
 
 function buildPrompt(messages) {
-  const turns = messages
-    .filter((m) => m?.role === "user" || m?.role === "assistant")
-    .map((m) => ({ role: m.role, text: contentText(m.content).trim() }))
-    .filter((m) => m.text)
-  if (turns.length <= 1 || turns.at(-1)?.role !== "user") return lastUserText(messages)
+  let turns = mergeTurns(messages)
+  // A harness that appends its own context after the assistant's reply leaves
+  // the conversation ending on the assistant once that context is stripped.
+  // The ask is still the last thing the user said, so go back to it and drop
+  // whatever came after.
+  const lastUser = turns.map((t) => t.role).lastIndexOf("user")
+  if (lastUser < 0) return ""
+  turns = turns.slice(0, lastUser + 1)
+  const question = turns.at(-1)
+
+  const note = question.dropped
+    ? `\n（注意：用户这条消息里带了 ${question.dropped} 个图片或文件附件，这个通道传不过去，你看不到它们的内容；需要的话直接跟用户说你看不到，别猜。）`
+    : ""
+
+  if (turns.length === 1) return question.text + note
 
   const kept = []
-  let used = 0
+  let used = question.text.length
   for (let i = turns.length - 1; i >= 0; i--) {
     const line = `${turns[i].role === "user" ? "用户" : "助手"}：${turns[i].text}`
     if (kept.length && used + line.length > TRANSCRIPT_CAP) break
     kept.unshift(line)
     used += line.length
   }
-  if (kept.length <= 1) return lastUserText(messages)
-  return `${kept.join("\n")}\n请回答用户最后一句话。`
+  if (kept.length <= 1) return question.text + note
+  return `以下是此前的对话：\n${kept.join("\n")}\n请回答用户最后一条消息。${note}`
+}
+
+function lastUserText(messages) {
+  const turns = mergeTurns(messages)
+  for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "user") return turns[i].text
+  return ""
 }
 
 function openaiChunk(id, model, delta, finish) {
@@ -736,6 +786,8 @@ export const _internal = {
   modelMap,
   modelById,
   effortFor,
+  mergeTurns,
+  stripHarnessNoise,
   cookieHeader,
   contentText,
   lastUserText,

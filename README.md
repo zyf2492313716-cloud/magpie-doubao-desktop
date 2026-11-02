@@ -61,10 +61,29 @@ magpie plugin login doubao-free          # 选「使用本机豆包工作的登�
 所以插件把之前的轮次拼成一段文字一起发过去（系统提示词不带，那是 harness 自己的
 东西，每轮付一遍不划算）。测试里就查这个：连着两轮，第二轮必须记得第一轮的暗号。
 
+## 一个已经踩过的坑：harness 自己塞进来的那段话
+
+DSH / OpenCode 这类 harness 会把自己的状态（当前时间、浏览器时区、注入的提醒）
+**作为额外的一条 user 消息**追加在末尾。一开始我把「回答用户最后一条消息」照原样
+发过去，结果用户发了张截图问「帮我下载这里面的课程 ppt」，豆包回的是：
+
+> It seems you've provided some time-related technical information, including the sampled time…
+
+——它老老实实回答了那段时钟文本，因为那才是「最后一条消息」，而图片根本没送到它手上。
+
+现在 `mergeTurns()` 会把 harness 那几块（`Current runtime context.` /
+`Time sampled while preparing turn…` / `Browser time zone…` / `<system-reminder>`）
+从消息里剔掉，连续的同一方消息合并成一条，剔完如果结尾落在助手身上就退回上一条
+真正的用户提问。测试里 `a harness's own context never becomes the question` 就是钉这个的。
+
+**这是尽力而为的**：匹配的是本机几个 harness 实际发出来的形状，换个 harness 用别的
+写法就可能漏。
+
 ## 限制
 
 - **不发工具**。这个聊天接口没有放工具声明的地方，所以三个模型都标 `tool_call: false`。
-- **只发文字**，图片不送。
+- **只发文字**。图片、文件传不过去；插件会在提示里明确告诉模型「这条消息带了 N 个
+  附件你看不到，别猜」，免得它像上面那样编。
 - 历史按 6000 字截，从最近的往前留。
 - 只在 macOS 上读本机登录。
 - 每 40 轮换一个豆包会话，免得在你自己的豆包列表里堆出一个无限长的会话。

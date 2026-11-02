@@ -141,6 +141,49 @@ const offline = [
     assert.ok(!kept.includes("第0轮"), "the oldest goes first")
   }],
 
+  ["a harness's own context never becomes the question", async () => {
+    // What actually broke in real use: the harness appends its clock and time
+    // zone as a trailing user message, and "answer the last message" then made
+    // Doubao reply about the timestamp while the user's ask, and the picture
+    // it referred to, went unanswered.
+    const ask = { role: "user", content: [{ type: "text", text: "帮我下载这里面的课程ppt" }, { type: "image" }] }
+    const noise = {
+      role: "user",
+      content:
+        "Time sampled while preparing turn 19, step 1: 2026-11-02T20:40:12+08:00[Asia/Shanghai]\n" +
+        "Browser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.\n" +
+        "Elapsed since the preceding model-visible message: 1h 15m 58s.",
+    }
+
+    const one = _internal.buildPrompt([ask, noise])
+    assert.match(one, /帮我下载/, "the ask is what gets asked")
+    assert.ok(!one.includes("Time sampled"), "the harness's clock is not part of the question")
+
+    // The same, with the assistant's reply in between, so the stripped noise
+    // would otherwise leave the conversation ending on the assistant.
+    const after = _internal.buildPrompt([ask, { role: "assistant", content: "我先看看" }, noise])
+    assert.match(after, /帮我下载/)
+    assert.ok(!after.includes("我先看看"), "an unfinished reply isn't history either")
+
+    // An attachment that can't be sent is said so, instead of being guessed at.
+    assert.match(one, /看不到/, "the model is told the picture didn't arrive")
+    assert.ok(!_internal.buildPrompt([{ role: "user", content: "纯文字问题" }]).includes("看不到"), "no note when nothing was dropped")
+
+    // Nothing but harness context: no question, and no request is made up.
+    assert.equal(_internal.buildPrompt([noise]), "")
+    assert.equal(_internal.buildPrompt([]), "")
+
+    // System prompt stays out, and the current ask is last.
+    const multi = _internal.buildPrompt([
+      { role: "system", content: "一长段 harness 的系统提示词" },
+      { role: "user", content: "第一问" },
+      { role: "assistant", content: "第一答" },
+      { role: "user", content: "第二问" },
+    ])
+    assert.ok(!multi.includes("系统提示词"))
+    assert.ok(multi.indexOf("第二问") > multi.indexOf("第一问"))
+  }],
+
   ["the OpenAI chunk is well formed", async () => {
     const chunk = JSON.parse(_internal.openaiChunk("id1", "m", { content: "hi" }).replace(/^data: /, ""))
     assert.equal(chunk.choices[0].delta.content, "hi")
