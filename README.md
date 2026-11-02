@@ -1,0 +1,95 @@
+# magpie-doubao-desktop
+
+magpie / OpenCode 的 provider 插件：用**本机「豆包工作」桌面端已有的登录**来跑豆包对话。
+不装 Docker，不抓包，不用从 DevTools 里粘 Cookie——点一下登录就好。
+
+> ⚠️ **先看清这个再决定要不要用**
+>
+> 豆包（doubao.com）没有对外的第三方授权接口。这个插件走的是桌面端自己那份登录态，
+> 直接调它的私有接口。magpie 官方仓库的维护者明确评估过并拒绝收录这类插件，理由是
+> **这违反字节的服务条款，也可能让账号被风控**。原话（PR #548 的 review）：
+>
+> > doubao.com 没有官方第三方接入路径，它的网页聊天有 bot 检测，用拷贝出来的浏览器
+> > 会话去驱动它违反 ByteDance 的条款，并让用户账号有风险。我们不接受用这种方式接
+> > 消费级聊天产品的插件。
+>
+> 所以这个包**只适合自己用**。被封号、被限流、哪天接口改了直接失效，都是自己要承担的。
+> 想要稳的、能商用的，走官方：**火山方舟（Volcengine Ark）**，magpie 内置就有——
+> `magpie provider add volcengine <key>`。
+
+## 装
+
+```sh
+magpie plugin add github:zyf2492313716-cloud/magpie-doubao-desktop
+magpie plugin login doubao-free          # 选「使用本机豆包工作的登录」
+```
+
+前提：本机装了「豆包工作」（DoubaoWork）并且已经登录。目前只在 macOS 上读过那份登录。
+
+## 它做了什么
+
+- 读 `~/Library/Application Support/DoubaoWork/Default/Cookies`：**复制一份出来读，读完删掉**，
+  不写它、不改它、不删它的原文件。
+- Cookie 的密钥来自这个应用自己的钥匙串条目 `DoubaoWork Browser Safe Storage`，
+  按 Chromium 那套 PBKDF2 + AES-128-CBC 解出来。第一次会弹一次系统授权框。
+- 对话：`POST /samantha/thread/create` 开一个会话，`POST /chat/completion` 发一条，SSE 收。
+  带着这份登录去调，**不需要算签名**。
+
+## 模型
+
+下面三个是从豆包工作自己缓存的配置里读出来的（`Default/Preferences` →
+`frontend-request-cache` → `modeSelectData`），不是我编的名字：
+
+| id | 名称 | 应用里的 model_item_key | 窗口 |
+|---|---|---|---|
+| `auto` | 自动 · 豆包 | `9` | 256k |
+| `doubao-2.1-pro` | 豆包 2.1 Pro | `5` | 256k |
+| `doubao-2.1-lite` | 豆包 2.1 Lite | `seed-lite-7b` | 256k |
+
+`reasoningEffort` 会按应用自己的写法放进 `ext.reasoning_effort`（3 低 / 4 中 / 5 高，默认 5）。
+
+**没验证的部分要说清楚**：`model_item_key` 是照桌面端的方式发过去的，但我没法证实
+服务端真的换了模型——问它「你是什么型号」，三个都拒绝透露，措辞不同也说明不了什么。
+256k 是应用自己标的 `total_window_size`，不是我测出来的上限。
+
+## 上下文是自己带过去的
+
+豆包的历史存在服务端，但**从这里发的请求它不给加载**。同一个会话连着问两轮，
+第二轮完全不记得第一轮——试过的都不行：新建会话、用已有的 `conversation_type: 1`
+会话、回传 ack 里的 `section_id` 和 `message_index`、固定 `unique_key`。
+
+所以插件把之前的轮次拼成一段文字一起发过去（系统提示词不带，那是 harness 自己的
+东西，每轮付一遍不划算）。测试里就查这个：连着两轮，第二轮必须记得第一轮的暗号。
+
+## 限制
+
+- **不发工具**。这个聊天接口没有放工具声明的地方，所以三个模型都标 `tool_call: false`。
+- **只发文字**，图片不送。
+- 历史按 6000 字截，从最近的往前留。
+- 只在 macOS 上读本机登录。
+- 每 40 轮换一个豆包会话，免得在你自己的豆包列表里堆出一个无限长的会话。
+  换掉的旧会话不会自动删除，介意的话自己去豆包里清。
+
+## 两个坑（写在这免得别人再踩）
+
+- **文字块的形状错了不会报错。** 得是 `block_type: 10000` + `content.text_block.text`。
+  写成 `{type:1, text:{body}}` 服务端**照样收**、照样 ACK、照样回一大段流畅的话——
+  只是回的是「你没说清楚需求呢」。问题根本没送到模型。
+- **一条回答分两路来**：`STREAM_CHUNK` 里 `patch_object: 102` 的增量，和
+  `STREAM_MSG_NOTIFY` 里那块累积文字。两条是互补的，不是重复的——短回答真的会是
+  累积块里给一个字、下一个字走增量。只取一条会截断，两条都取会重字。
+
+## 测
+
+```sh
+bun test doubao-free.test.mjs            # 不联网：形状、文字块、两路拼装、上下文拼接
+DOUBAO_E2E=1 bun test doubao-free.test.mjs   # 真发对话（要装了豆包工作并登录）
+```
+
+联网那几条问的都是有唯一答案的问题（「中国的首都是哪里」查「北京」、「1+1」查「2」），
+最后一条连着问两轮、查第二轮记不记得第一轮的暗号。**只看「有没有吐出字」是查不出
+上面那两个坑的**——两个都真踩过。
+
+## License
+
+MIT

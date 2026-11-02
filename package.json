@@ -1,0 +1,34 @@
+{
+  "name": "magpie-doubao-desktop",
+  "version": "0.1.0",
+  "description": "Doubao (豆包) chat models, signed in with the 豆包工作 desktop app's own session",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zyf2492313716-cloud/magpie-doubao-desktop.git"
+  },
+  "scripts": {
+    "test": "bun test doubao-free.test.mjs"
+  },
+  "magpie": {
+    "icon": "https://lf-flow-web-cdn.doubao.com/obj/flow-doubao/doubao/web/logo-icon.png",
+    "maxConcurrency": 2
+  },
+  "homepage": "https://github.com/zyf2492313716-cloud/magpie-doubao-desktop",
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "doubao",
+    "豆包"
+  ]
+}
