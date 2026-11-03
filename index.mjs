@@ -502,7 +502,7 @@ function toolSpec(tools) {
     "你可以调用这些工具：",
     JSON.stringify(list.map((f) => ({ name: f.name, description: f.description ?? "", parameters: f.parameters ?? {} }))),
     `要调用工具时，每个调用单独一行：${MARK_OPEN} {"name":"工具名","arguments":{参数JSON}} ${MARK_CLOSE}`,
-    "需要多个工具就输出多行。不需要工具就直接正常回答。绝不要自己编造工具结果，把调用交出来等系统回结果再继续。",
+    "需要多个工具就输出多行。arguments 必须带上该工具 parameters.required 里列的每个字段（值从用户的话里取），禁止空对象。不需要工具就直接正常回答。绝不要自己编造工具结果，把调用交出来等系统回结果再继续。",
   ].join("\n")
 }
 
