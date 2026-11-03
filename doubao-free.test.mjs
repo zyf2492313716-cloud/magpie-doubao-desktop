@@ -25,7 +25,7 @@ const offline = [
     const p = cfg.provider[_internal.PROVIDER]
     assert.equal(p.npm, "@ai-sdk/openai-compatible")
     assert.ok(Object.keys(p.models).length >= 3)
-    assert.equal(p.models["doubao-2.1-pro"].tool_call, false, "tools are not sent")
+    assert.equal(p.models["doubao-2.1-pro"].tool_call, true, "tools ride the emulated protocol")
     assert.equal(
       Object.values(p.models).every((m) => m.reasoning === false),
       true,
@@ -189,6 +189,54 @@ const offline = [
     assert.ok(multi.indexOf("第二问") > multi.indexOf("第一问"))
   }],
 
+  ["the tool protocol round-trips", async () => {
+    const spec = _internal.toolSpec([{ type: "function", function: { name: "read", description: "读文件", parameters: { type: "object", properties: { path: { type: "string" } } } } }])
+    assert.match(spec, /"name":"read"/)
+    assert.match(spec, /TOOL_CALL/)
+    assert.equal(_internal.toolSpec([]), "", "no tools, no spec")
+    assert.equal(_internal.toolSpec(undefined), "")
+
+    const { calls, rest, pending } = _internal.extractCalls(
+      '好的。TOOL_CALL {"name":"read","arguments":{"path":"/a.txt"}} END_CALL 等一下再看。',
+    )
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].name, "read")
+    assert.deepEqual(calls[0].arguments, { path: "/a.txt" })
+    assert.ok(!rest.includes("TOOL_CALL"), "the marker itself is consumed")
+    assert.ok(rest.includes("好的"), "ordinary words stay ordinary")
+    assert.equal(pending, false)
+
+    const dangle = _internal.extractCalls("TOOL_CALL {\"na")
+    assert.equal(dangle.calls.length, 0)
+    assert.equal(dangle.pending, true, "an unfinished marker is not eaten")
+
+    const nested = _internal.extractCalls('TOOL_CALL {"name":"edit","arguments":{"path":"/x","edits":[{"old":"a}b","new":"c"}]}} END_CALL')
+    assert.equal(nested.calls.length, 1, "braces inside arguments do not end the json early")
+
+    const bogus = _internal.extractCalls('TOOL_CALL {not json} END_CALL')
+    assert.equal(bogus.calls.length, 0)
+    assert.ok(bogus.rest.includes("TOOL_CALL"), "an unparseable marker is shown as text, not swallowed")
+
+    // a tool result is rendered back with its name, and answers continue from it
+    const delta = _internal.toolCallDelta(0, { name: "read", arguments: {} }) // registers id->name, like a real turn
+    const msgs = [
+      { role: "user", content: "读一下 /a.txt" },
+      { role: "assistant", content: "", tool_calls: [delta] },
+      { role: "tool", tool_call_id: delta.id, content: "文件内容在此" },
+    ]
+    const p2 = _internal.buildPrompt(msgs)
+    assert.ok(p2.includes("TOOL_CALL"), "the model's own call is in the transcript")
+    assert.ok(p2.includes("工具 read 的返回结果"), "the result is credited to its tool by name")
+    assert.ok(p2.includes("继续回答"), "the ask after a result is to continue, not to restart")
+
+    // a plain assistant sentence mid-turn is not mistaken for history
+    const p3 = _internal.buildPrompt([
+      { role: "user", content: "问题" },
+      { role: "assistant", content: "半截话" },
+    ])
+    assert.ok(!p3.includes("半截话"))
+  }],
+
   ["the OpenAI chunk is well formed", async () => {
     const chunk = JSON.parse(_internal.openaiChunk("id1", "m", { content: "hi" }).replace(/^data: /, ""))
     assert.equal(chunk.choices[0].delta.content, "hi")
@@ -293,6 +341,43 @@ if (process.env.DOUBAO_E2E === "1") {
     const second = r2.choices?.[0]?.message?.content ?? ""
     assert.match(second, /紫罗兰/, "第二轮没接住第一轮：" + JSON.stringify(second))
     console.log("✓ 多轮记忆：", JSON.stringify(second))
+
+    // The whole point of 0.2.0: a real tool round-trip over the emulated
+    // protocol, streamed, the way a harness drives it.
+    const TOOLS = [{
+      type: "function",
+      function: { name: "get_weather", description: "查询城市当前天气", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } },
+    }]
+    const q = [{ role: "user", content: "上海今天天气怎么样？用工具查。" }]
+    const tr1 = await loader.fetch(url, { method: "POST", body: JSON.stringify({ model: "doubao-2.1-pro", stream: true, tools: TOOLS, messages: q }) })
+    const tr1raw = await tr1.text()
+    const tr1parts = tr1raw.split("\n\n").filter((l) => l.startsWith("data: ") && l !== "data: [DONE]").map((l) => JSON.parse(l.slice(6)))
+    const callDeltas = tr1parts.flatMap((p) => p.choices?.[0]?.delta?.tool_calls ?? [])
+    assert.equal(tr1parts.at(-1).choices[0].finish_reason, "tool_calls", "回合 1 必须以 tool_calls 收尾：" + JSON.stringify(tr1parts.at(-1)))
+    assert.ok(callDeltas.length >= 1, "至少一个 tool_call")
+    assert.equal(callDeltas[0].function.name, "get_weather")
+    assert.match(callDeltas[0].function.arguments, /上海/, "参数里得带上城市")
+    const call = callDeltas[0]
+    console.log("✓ 工具回合 1（流式吐调用）：", JSON.stringify(call.function))
+
+    const tr2 = await loader.fetch(url, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "doubao-2.1-pro",
+        stream: false,
+        tools: TOOLS,
+        messages: [
+          ...q,
+          { role: "assistant", content: null, tool_calls: [call] },
+          { role: "tool", tool_call_id: call.id, content: JSON.stringify({ city: "上海", temp: "22C", sky: "多云" }) },
+        ],
+      }),
+    })
+    const tr2json = await tr2.json()
+    assert.ok(!tr2json.error, "回合 2 失败：" + JSON.stringify(tr2json.error))
+    const final = tr2json.choices[0].message.content ?? ""
+    assert.match(final, /22/, "回答必须用上工具结果：" + JSON.stringify(final))
+    console.log("✓ 工具回合 2（喂结果出答案）：", JSON.stringify(final.slice(0, 80)))
   }
 }
 

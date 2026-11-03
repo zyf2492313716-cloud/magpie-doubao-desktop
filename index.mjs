@@ -68,7 +68,9 @@ function modelMap() {
         // empty thinking pane, so it says false and the reasoning stays in
         // the text where it arrives.
         reasoning: false,
-        tool_call: false,
+        // Tools are accepted: the plugin speaks tool calling to this
+        // text-only endpoint through the prompt protocol above.
+        tool_call: true,
       },
     ]),
   )
@@ -475,15 +477,114 @@ function stripHarnessNoise(text) {
 // Consecutive turns from one side are one turn: a harness that sends the ask
 // and then its own context block as two user messages shouldn't read as two
 // questions.
+// ---- tool calling, emulated at this layer --------------------------------
+//
+// Doubao's chat endpoint has no tool protocol: it takes text and returns
+// text. But it follows a prompt-level protocol cleanly (checked 2026-11-03:
+// given the spec below it emitted exactly one TOOL_CALL line with valid JSON,
+// and after a fed-back TOOL_RESULT it answered from that result). So the
+// plugin translates OpenAI tools into that protocol and turns the model's
+// marker lines back into real tool_calls, which magpie/OpenCode see as native.
+
+const MARK_OPEN = "TOOL_CALL"
+const MARK_CLOSE = "END_CALL"
+
+// id -> tool name, so a role:"tool" result (which only carries the call id)
+// can be rendered back into the transcript with its name.
+const toolNames = new Map()
+
+function toolSpec(tools) {
+  const list = (Array.isArray(tools) ? tools : [])
+    .map((t) => t?.function ?? t)
+    .filter((f) => f && typeof f.name === "string" && f.name)
+  if (!list.length) return ""
+  return [
+    "你可以调用这些工具：",
+    JSON.stringify(list.map((f) => ({ name: f.name, description: f.description ?? "", parameters: f.parameters ?? {} }))),
+    `要调用工具时，每个调用单独一行：${MARK_OPEN} {"name":"工具名","arguments":{参数JSON}} ${MARK_CLOSE}`,
+    "需要多个工具就输出多行。不需要工具就直接正常回答。绝不要自己编造工具结果，把调用交出来等系统回结果再继续。",
+  ].join("\n")
+}
+
+// Pull complete marker calls out of a text. rest is everything they weren't;
+// pending marks a dangling TOOL_CALL whose END_CALL hasn't arrived, and cut
+// is how far the scan settled.
+function extractCalls(text, from = 0) {
+  const calls = []
+  let rest = ""
+  let cursor = 0
+  for (;;) {
+    const open = text.indexOf(MARK_OPEN, cursor)
+    if (open < 0) {
+      rest += text.slice(cursor)
+      return { calls, rest, pending: false, cut: text.length }
+    }
+    rest += text.slice(cursor, open)
+    const brace = text.indexOf("{", open)
+    const close = brace < 0 ? -1 : text.indexOf(MARK_CLOSE, brace)
+    if (brace < 0 || close < 0) {
+      // the call hasn't streamed in fully; leave the marker for the next pass
+      return { calls, rest, pending: true, cut: open }
+    }
+    const consumed = close + MARK_CLOSE.length
+    const jsonEnd = text.lastIndexOf("}", close)
+    if (jsonEnd > brace) {
+      try {
+        const o = JSON.parse(text.slice(brace, jsonEnd + 1))
+        if (o && typeof o.name === "string" && o.name) {
+          calls.push({ name: o.name, arguments: o.arguments ?? {} })
+          cursor = consumed
+          continue
+        }
+      } catch {}
+    }
+    rest += text.slice(open, consumed) // unusable marker: show it as it came
+    cursor = consumed
+  }
+}
+
+function toolCallDelta(index, call) {
+  const id = "call_" + crypto.randomUUID().slice(0, 10)
+  toolNames.set(id, call.name)
+  return { index, id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }
+}
+
+// One message rendered to transcript text. A tool result carries no name of
+// its own (just the call id), so the id->name map from when the call was
+// issued fills it in; the phrasing here is what the model was tested with.
+function turnText(m) {
+  if (m?.role === "tool") {
+    const name = toolNames.get(m.tool_call_id) ?? (typeof m.name === "string" ? m.name : "")
+    const body = contentText(m.content).trim()
+    if (!body) return null
+    return { role: "tool", text: name ? `工具 ${name} 的返回结果：${body}` : `工具返回结果：${body}`, dropped: 0 }
+  }
+  if (m?.role !== "user" && m?.role !== "assistant") return null
+  let text = stripHarnessNoise(contentText(m.content))
+  const calls = Array.isArray(m?.tool_calls) ? m.tool_calls : []
+  if (calls.length) {
+    const lines = calls.map((c) => {
+      let args = c?.function?.arguments
+      if (typeof args === "string") { try { args = JSON.parse(args) } catch {} }
+      return `${MARK_OPEN} ${JSON.stringify({ name: c?.function?.name ?? "", arguments: args ?? {} })} ${MARK_CLOSE}`
+    })
+    text = [text, ...lines].filter(Boolean).join("\n")
+  }
+  if (!text) return null
+  return { role: m.role, text, dropped: droppedParts(m.content) }
+}
+
+// Consecutive turns from one side are one turn: a harness that sends the ask
+// and then its own context block as two user messages shouldn't read as two
+// questions.
 function mergeTurns(messages) {
   const merged = []
-  for (const m of messages) {
-    if (m?.role !== "user" && m?.role !== "assistant") continue
-    const text = stripHarnessNoise(contentText(m.content))
-    if (!text) continue
+  for (const m of Array.isArray(messages) ? messages : []) {
+    const t = turnText(m)
+    if (!t) continue
     const last = merged.at(-1)
-    if (last && last.role === m.role) last.text += "\n\n" + text
-    else merged.push({ role: m.role, text, dropped: droppedParts(m.content) })
+    if (last && last.role === t.role) { last.text += "\n\n" + t.text; last.dropped += t.dropped; continue }
+    merged.push(t)
   }
   return merged
 }
@@ -497,38 +598,42 @@ function mergeTurns(messages) {
 const TRANSCRIPT_CAP = 6000 // characters of history, newest kept first
 
 function buildPrompt(messages) {
-  let turns = mergeTurns(messages)
-  // A harness that appends its own context after the assistant's reply leaves
-  // the conversation ending on the assistant once that context is stripped.
-  // The ask is still the last thing the user said, so go back to it and drop
-  // whatever came after.
+  const turns = mergeTurns(messages)
   const lastUser = turns.map((t) => t.role).lastIndexOf("user")
   if (lastUser < 0) return ""
-  turns = turns.slice(0, lastUser + 1)
-  const question = turns.at(-1)
-
+  const question = turns[lastUser]
   const note = question.dropped
     ? `\n（注意：用户这条消息里带了 ${question.dropped} 个图片或文件附件，这个通道传不过去，你看不到它们的内容；需要的话直接跟用户说你看不到，别猜。）`
     : ""
+  // What came after the ask: the model's own calls and the tool results that
+  // came back, which the next answer must see.
+  // Only tool traffic survives after the ask: a plain assistant sentence there
+  // is a reply the harness never finished sending, not history.
+  const trail = turns.slice(lastUser + 1).filter((t) => t.role === "tool" || t.text.includes(MARK_OPEN))
+  if (turns.length === 1 && !trail.length) return question.text + note
 
-  if (turns.length === 1) return question.text + note
-
+  const label = (r) => (r === "user" ? "用户" : r === "assistant" ? "助手" : "")
+  const lineOf = (t) => (t.role === "tool" ? t.text : `${label(t.role)}：${t.text}`)
+  const all = [...turns.slice(0, lastUser + 1), ...trail]
   const kept = []
   let used = question.text.length
-  for (let i = turns.length - 1; i >= 0; i--) {
-    const line = `${turns[i].role === "user" ? "用户" : "助手"}：${turns[i].text}`
+  for (let i = all.length - 1; i >= 0; i--) {
+    const line = lineOf(all[i])
     if (kept.length && used + line.length > TRANSCRIPT_CAP) break
     kept.unshift(line)
     used += line.length
   }
-  if (kept.length <= 1) return question.text + note
-  return `以下是此前的对话：\n${kept.join("\n")}\n请回答用户最后一条消息。${note}`
+  if (kept.length <= 1 && !trail.length) return question.text + note
+  const ask = trail.some((t) => t.role === "tool")
+    ? "请根据上面的工具返回结果，继续回答用户的问题。"
+    : "请回答用户最后一条消息。"
+  return `以下是此前的对话：\n${kept.join("\n")}\n${ask}${note}`
 }
 
 function lastUserText(messages) {
   const turns = mergeTurns(messages)
-  for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "user") return turns[i].text
-  return ""
+  const i = turns.map((t) => t.role).lastIndexOf("user")
+  return i < 0 ? "" : turns[i].text
 }
 
 function openaiChunk(id, model, delta, finish) {
@@ -671,8 +776,13 @@ function makePlugin() {
               }
 
               const messages = Array.isArray(body.messages) ? body.messages : []
-              const prompt = buildPrompt(messages)
-              if (!prompt) return jsonError("豆包插件需要一个 user 消息", "invalid_request_error", 400)
+              const spec = toolSpec(body.tools)
+              const base = buildPrompt(messages)
+              if (!base) return jsonError("豆包插件需要一个 user 消息", "invalid_request_error", 400)
+              // The protocol rides at the front of every turn: the endpoint has
+              // no memory, and after a tool result the model must see the rules
+              // again to answer through it.
+              const prompt = spec ? `${spec}\n\n${base}` : base
 
               let cookies
               try {
@@ -713,13 +823,26 @@ function makePlugin() {
                   thread = null // a fresh conversation next time
                   return jsonError(e?.message ?? String(e), "api_error", 502)
                 }
+                const picked = spec ? extractCalls(text) : { calls: [], rest: text }
                 return new Response(
                   JSON.stringify({
                     id,
                     object: "chat.completion",
                     created: Math.floor(Date.now() / 1000),
                     model,
-                    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+                    choices: [
+                      {
+                        index: 0,
+                        message: {
+                          role: "assistant",
+                          content: picked.rest || null,
+                          ...(picked.calls.length
+                            ? { tool_calls: picked.calls.map((call) => toolCallDelta(0, call)) }
+                            : {}),
+                        },
+                        finish_reason: picked.calls.length ? "tool_calls" : "stop",
+                      },
+                    ],
                     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                   }),
                   { headers: { "Content-Type": "application/json" } },
@@ -738,13 +861,27 @@ function makePlugin() {
                   }
                   try {
                     send(openaiChunk(id, model, { role: "assistant" }))
-                    let any = false
-                    for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) {
-                      any = true
-                      send(openaiChunk(id, model, { content: piece }))
+                    if (spec) {
+                      // Tool turns are buffered and re-emitted whole: the
+                      // marker can split across deltas in ways a live stream
+                      // can't undo, and a call line is short anyway.
+                      let text = ""
+                      for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) text += piece
+                      const picked = extractCalls(text)
+                      if (picked.rest) send(openaiChunk(id, model, { content: picked.rest }))
+                      picked.calls.forEach((call, i) =>
+                        send(openaiChunk(id, model, { tool_calls: [toolCallDelta(i, call)] })),
+                      )
+                      send(openaiChunk(id, model, {}, picked.calls.length ? "tool_calls" : "stop"))
+                    } else {
+                      let any = false
+                      for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) {
+                        any = true
+                        send(openaiChunk(id, model, { content: piece }))
+                      }
+                      if (!any) send(openaiChunk(id, model, { content: "" }))
+                      send(openaiChunk(id, model, {}, "stop"))
                     }
-                    if (!any) send(openaiChunk(id, model, { content: "" }))
-                    send(openaiChunk(id, model, {}, "stop"))
                     send("data: [DONE]\n\n")
                   } catch (e) {
                     thread = null // a fresh conversation next time
@@ -795,6 +932,9 @@ export const _internal = {
   modelById,
   effortFor,
   mergeTurns,
+  toolSpec,
+  extractCalls,
+  toolCallDelta,
   stripHarnessNoise,
   cookieHeader,
   contentText,
