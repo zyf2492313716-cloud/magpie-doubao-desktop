@@ -45,6 +45,7 @@ magpie plugin login doubao-free          # 选「使用本机豆包工作的登�
 | `auto` | 自动 · 豆包 | `9` | 256k |
 | `doubao-2.1-pro` | 豆包 2.1 Pro | `5` | 256k |
 | `doubao-2.1-lite` | 豆包 2.1 Lite | `seed-lite-7b` | 256k |
+| `doubao-task` | 豆包 · 工作任务 | `5` + `mode_id=3` | 256k |
 
 `reasoningEffort` 会按应用自己的写法放进 `ext.reasoning_effort`（3 低 / 4 中 / 5 高，默认 5）。
 
@@ -115,6 +116,29 @@ harness 执行完发 role:"tool"  插件把 调用→结果 渲染回 transcript
   时候没调，概率比原生接口高。解析失败时标记原样当文本退回，不会崩，但那一轮等于白跑。
 - 每轮都要重发工具说明，token 花在最前面对话头。
 - 并行调用按多行协议走，一次多个调用没问题；但「边说边调」的中途插话它学不会。
+
+## 逆向过桌面端，然后把话说死在这
+
+豆包工作**确实**能执行终端、读文件、操控其他 App——但那套东西不在这条 wire 上。
+实测（伪造桌面 UA、带上 `agent_mode=1/mode_id=3`、拿它自己的登录态）：
+
+- `mode_id=3` 会真的把服务端路由从 `mobile_general_nocot_agent` 切到
+  `Agent-GeneralTask`（SSE 的 ext 里能看到），所以我们照它做了 `doubao-task` 模型；
+- 但回答里照样没有本地执行：桌面端的执行器（`AgentInfraService.xpc`、
+  `McpService.xpc`、终端/AX 代理那套）走的是**桌面端自己的私有通道**，
+  需要设备级证明，纯 HTTP 请求它不认；
+- 就算把那套私有协议整个啃下来，工具目录也是豆包服务端写死的——magpie
+  递进来的 bash/read/write 它还是看不见，等于白啃。
+
+所以工具能力的天花板就在这：**`doubao-task` 是服务端自己变强，工具回合是插件层
+协议模拟，两条都到不了 Qoder 那种原生 wire 支持**。Qoder 的接口天生吃
+`tools`/吐 `tool_calls`，豆包的天生只吃文字。这是起跑线差，不是工程差。
+
+## 0.3.0 从逆向里捡回来的三件
+
+- `doubao-task`：走服务端 `Agent-GeneralTask` 路由，实测答案更结构化；
+- 工具结果超过 2000 字自动掐中间留头尾，读个大文件不会再把上下文挤爆；
+- 模型偶尔吐 `arguments:{}`，插件自己重问一轮纠正，不再烧掉 harness 一个回合。
 
 ## 限制
 

@@ -36,6 +36,11 @@ const MODELS = [
   { id: "auto", name: "自动 · 豆包", key: "9", context: 256000, efforts: [3, 4, 5] },
   { id: "doubao-2.1-pro", name: "豆包 2.1 Pro", key: "5", context: 256000, efforts: [3, 4, 5] },
   { id: "doubao-2.1-lite", name: "豆包 2.1 Lite", key: "seed-lite-7b", context: 256000, efforts: [3, 4, 5] },
+  // mode_id=3 rides the server's 工作任务 route (intention_agent_name became
+  // Agent-GeneralTask with it, vs mobile_general_nocot_agent without). It is
+  // still the chat wire — the desktop's local tool executor is not on it —
+  // but the server thinks harder along its own multi-step path.
+  { id: "doubao-task", name: "豆包 · 工作任务", key: "5", mode: "3", context: 256000, efforts: [3, 4, 5] },
 ]
 
 // 低 / 中 / 高, the three levels the app offers; the app's own default is 5.
@@ -306,7 +311,9 @@ function newAccumulator() {
   }
 }
 
-async function* streamCompletion(cookies, conversationId, prompt, modelKey, effort, signal) {
+async function* streamCompletion(cookies, conversationId, prompt, model, effort, signal) {
+  const modelKey = model?.key ?? ""
+  const modeId = model?.mode ?? ""
   const uid = crypto.randomUUID()
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai"
   const body = {
@@ -329,13 +336,15 @@ async function* streamCompletion(cookies, conversationId, prompt, modelKey, effo
         // How 豆包工作 itself names the model it wants and how hard it should
         // think; both go in the message's ext, and again in the conversation's
         // init options when the conversation is this plugin's own.
-        ext: { is_finish: "1", ...(modelKey ? { model_item_key: modelKey } : {}), ...(effort ? { reasoning_effort: String(effort) } : {}) },
+        ext: { is_finish: "1", ...(modelKey ? { model_item_key: modelKey } : {}), ...(effort ? { reasoning_effort: String(effort) } : {}), ...(modeId ? { mode_id: modeId } : {}) },
       },
     ],
     option: {
       send_message_scene: "",
       create_time_ms: Date.now(),
-      ...(modelKey || effort ? { conversation_init_ext: { ...(modelKey ? { model_item_key: modelKey } : {}), ...(effort ? { reasoning_effort: String(effort) } : {}) } } : {}),
+      ...(modelKey || effort || modeId
+        ? { conversation_init_ext: { ...(modelKey ? { model_item_key: modelKey } : {}), ...(effort ? { reasoning_effort: String(effort) } : {}), ...(modeId ? { mode_id: modeId } : {}) } }
+        : {}),
     },
   }
   const res = await withRetry(() =>
@@ -543,6 +552,39 @@ function extractCalls(text, from = 0) {
   }
 }
 
+// A file the agent just read can be megabytes; the transcript carries tool
+// results verbatim otherwise and the ask drowns. Keep the head (where files
+// and tables start meaningfully) and the tail (where completions end).
+const TOOL_RESULT_CAP = 2000
+function elide(text) {
+  if (typeof text !== "string" || text.length <= TOOL_RESULT_CAP) return text
+  return `${text.slice(0, 1500)}\n……（此处省略 ${text.length - 1900} 字）……\n${text.slice(-400)}`
+}
+
+// name -> required params, so an empty arguments:{} can be recognised as the
+// mistake it is (seen once in the first smoke) and corrected without burning
+// a harness round-trip.
+function requiredFields(tools) {
+  const out = {}
+  for (const t of Array.isArray(tools) ? tools : []) {
+    const f = t?.function ?? t
+    if (f?.name) out[f.name] = Array.isArray(f.parameters?.required) ? f.parameters.required : []
+  }
+  return out
+}
+
+function needsRefill(picked, required) {
+  return (picked?.calls ?? []).some((c) => {
+    const req = required[c.name] ?? []
+    if (!req.length) return false
+    const a = c.arguments
+    return !a || typeof a !== "object" || !Object.keys(a).length
+  })
+}
+
+const REFILL_NOTE =
+  "\n\n（系统纠正：上一条 TOOL_CALL 的 arguments 是空对象，缺了该工具 required 里列的字段。只重新输出那几行 TOOL_CALL，参数值从上面的对话里取。）"
+
 function toolCallDelta(index, call) {
   const id = "call_" + crypto.randomUUID().slice(0, 10)
   toolNames.set(id, call.name)
@@ -555,7 +597,7 @@ function toolCallDelta(index, call) {
 function turnText(m) {
   if (m?.role === "tool") {
     const name = toolNames.get(m.tool_call_id) ?? (typeof m.name === "string" ? m.name : "")
-    const body = contentText(m.content).trim()
+    const body = elide(contentText(m.content).trim())
     if (!body) return null
     return { role: "tool", text: name ? `工具 ${name} 的返回结果：${body}` : `工具返回结果：${body}`, dropped: 0 }
   }
@@ -815,15 +857,42 @@ function makePlugin() {
               const chosen = modelById(body.model)
               const model = typeof body.model === "string" && body.model ? body.model : chosen.id
 
+              const collect = async (p) => {
+                let t = ""
+                for await (const piece of streamCompletion(cookies, conversationId, p, chosen, effortFor(body), signal)) t += piece
+                return t
+              }
+              // A tool turn is one collect (plus at most one correction
+              // pass) shared by both the stream and the non-stream shape.
+              let toolPicked = null
+              let turnError = null
+              if (spec) {
+                try {
+                  toolPicked = extractCalls(await collect(prompt))
+                  if (needsRefill(toolPicked, requiredFields(body.tools))) {
+                    const again = extractCalls(await collect(prompt + REFILL_NOTE))
+                    if (again.calls.length && !needsRefill(again, requiredFields(body.tools))) toolPicked = again
+                  }
+                } catch (e) {
+                  turnError = e
+                }
+              }
+              if (turnError) {
+                thread = null
+                return jsonError(turnError?.message ?? String(turnError), "api_error", 502)
+              }
+
               if (body.stream === false) {
                 let text = ""
-                try {
-                  for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) text += piece
-                } catch (e) {
-                  thread = null // a fresh conversation next time
-                  return jsonError(e?.message ?? String(e), "api_error", 502)
+                if (!spec) {
+                  try {
+                    text = await collect(prompt)
+                  } catch (e) {
+                    thread = null // a fresh conversation next time
+                    return jsonError(e?.message ?? String(e), "api_error", 502)
+                  }
                 }
-                const picked = spec ? extractCalls(text) : { calls: [], rest: text }
+                const picked = spec ? toolPicked : { calls: [], rest: text }
                 return new Response(
                   JSON.stringify({
                     id,
@@ -865,9 +934,7 @@ function makePlugin() {
                       // Tool turns are buffered and re-emitted whole: the
                       // marker can split across deltas in ways a live stream
                       // can't undo, and a call line is short anyway.
-                      let text = ""
-                      for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) text += piece
-                      const picked = extractCalls(text)
+                      const picked = toolPicked
                       if (picked.rest) send(openaiChunk(id, model, { content: picked.rest }))
                       picked.calls.forEach((call, i) =>
                         send(openaiChunk(id, model, { tool_calls: [toolCallDelta(i, call)] })),
@@ -875,7 +942,7 @@ function makePlugin() {
                       send(openaiChunk(id, model, {}, picked.calls.length ? "tool_calls" : "stop"))
                     } else {
                       let any = false
-                      for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen.key, effortFor(body), signal)) {
+                      for await (const piece of streamCompletion(cookies, conversationId, prompt, chosen, effortFor(body), signal)) {
                         any = true
                         send(openaiChunk(id, model, { content: piece }))
                       }
@@ -935,6 +1002,9 @@ export const _internal = {
   toolSpec,
   extractCalls,
   toolCallDelta,
+  elide,
+  requiredFields,
+  needsRefill,
   stripHarnessNoise,
   cookieHeader,
   contentText,
